@@ -9,27 +9,33 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-# ---------- Journalisation ----------
+# ===================== Journalisation =====================
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s",
 )
 logger = logging.getLogger("reminder-bot")
 
-# ---------- Constantes ----------
-TZ = ZoneInfo("Europe/Paris")
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__),"data.db"))
+# ===================== Constantes =========================
+DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
 
-ALLOWED_MENTIONS = discord.AllowedMentions(roles=True, users=False, everyone=False)
+def get_tz() -> ZoneInfo | None:
+    try:
+        return ZoneInfo("Europe/Paris")
+    except Exception:
+        logger.warning("ZoneInfo Europe/Paris indisponible, datation sans fuseau.")
+        return None
 
-# ---------- Base de données ----------
+TZ = get_tz()
+
+# ===================== Base de données ====================
 def get_db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Crée les tables si besoin + colonnes nécessaires."""
+    """Crée les tables (si besoin)."""
     conn = get_db_conn()
     cur = conn.cursor()
     cur.executescript(
@@ -72,7 +78,7 @@ def upsert_setting(guild_id: int, field: str, value: Optional[int]):
     conn.commit()
     conn.close()
 
-def fetch_settings(guild_id: int):
+def fetch_settings(guild_id: int) -> Optional[sqlite3.Row]:
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM settings WHERE guild_id=?", (guild_id,))
@@ -80,27 +86,49 @@ def fetch_settings(guild_id: int):
     conn.close()
     return row
 
-# ---------- Bot & commandes ----------
+# ===================== Client & Intents ===================
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+def now_paris() -> datetime:
+    return datetime.now(TZ) if TZ else datetime.now()
+
+# ===================== Ready / Sync =======================
 @client.event
 async def on_ready():
     init_db()
     try:
+        # Sync globale (pour avoir les commandes partout)
+        await tree.sync()
+        logger.info("Commandes slash synchronisées globalement.")
+        # Sync immédiate par serveur (apparition instantanée)
         for g in client.guilds:
             await tree.sync(guild=g)
             logger.info(f"Commandes slash synchronisées IMMÉDIATEMENT pour le serveur: {g.name} (id={g.id})")
     except Exception as e:
         logger.exception(f"Erreur de synchronisation des commandes : {e}")
 
-    # Démarre la boucle de rappels
+    check_reminders.change_interval(seconds=30)  # 30s pour tester facilement
     check_reminders.start()
     logger.info(f"Connecté en tant que {client.user} (id={client.user.id})")
 
+# ===================== Utilitaires ========================
+def parse_fr_date_or_fail(date_str: str) -> Optional[datetime]:
+    try:
+        dt = datetime.strptime(date_str.strip(), "%d/%m/%Y")
+        return dt.replace(tzinfo=TZ) if TZ else dt
+    except ValueError:
+        return None
 
-# ---------- Commandes de configuration ----------
+def iso_to_fr(date_iso: str) -> str:
+    try:
+        d = datetime.fromisoformat(date_iso)
+        return d.strftime("%d/%m/%Y")
+    except Exception:
+        return date_iso
+
+# ===================== Commandes de réglage ==============
 @tree.command(name="set_salon_arrivants", description="Définir le salon pour les rappels d'arrivées")
 async def set_salon_arrivants(interaction: discord.Interaction, salon: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_guild:
@@ -125,7 +153,21 @@ async def set_role_gerants(interaction: discord.Interaction, role: discord.Role)
     upsert_setting(interaction.guild_id, "gerants_role_id", role.id)
     await interaction.response.send_message(f"✅ Rôle des gérants défini : {role.mention}", ephemeral=True)
 
-# ---------- Commandes principales ----------
+@tree.command(name="config", description="Afficher la configuration du serveur")
+async def config(interaction: discord.Interaction):
+    s = fetch_settings(interaction.guild_id)
+    if not s:
+        await interaction.response.send_message("Aucune config encore enregistrée.", ephemeral=True)
+        return
+    msg = (
+        f"**Config actuelle**\n"
+        f"- Salon arrivants: <#{s['arrivants_channel_id']}>\n"
+        f"- Salon condamnés: <#{s['condamnes_channel_id']}>\n"
+        f"- Rôle gérants: <@&{s['gerants_role_id']}>"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# ===================== Commandes principales ==============
 @tree.command(name="arrivee", description="Enregistrer l'arrivée d'un membre (date JJ/MM/AAAA)")
 @app_commands.describe(
     pseudo="Pseudo libre (pas forcément un membre Discord)",
@@ -141,12 +183,9 @@ async def set_role_gerants(interaction: discord.Interaction, role: discord.Role)
     ]
 )
 async def arrivee(interaction: discord.Interaction, pseudo: str, date: str, profil: app_commands.Choice[str]):
-    try:
-        dt = datetime.strptime(date.strip(), "%d/%m/%Y").replace(tzinfo=TZ)
-    except ValueError:
-        await interaction.response.send_message(
-            "❌ Date invalide. Format attendu : JJ/MM/AAAA (ex: 21/10/2025).", ephemeral=True
-        )
+    dt = parse_fr_date_or_fail(date)
+    if not dt:
+        await interaction.response.send_message("❌ Date invalide. Format attendu : JJ/MM/AAAA.", ephemeral=True)
         return
 
     conn = get_db_conn()
@@ -177,13 +216,9 @@ async def condamne(
     role_a_restituer: Optional[discord.Role] = None,
     role_nom: Optional[str] = None
 ):
-    try:
-        dt = datetime.strptime(date.strip(), "%d/%m/%Y").replace(tzinfo=TZ)
-    except ValueError:
-        await interaction.response.send_message(
-            "❌ Date invalide. Format attendu : JJ/MM/AAAA (ex: 21/10/2025).",
-            ephemeral=True
-        )
+    dt = parse_fr_date_or_fail(date)
+    if not dt:
+        await interaction.response.send_message("❌ Date invalide. Format attendu : JJ/MM/AAAA.", ephemeral=True)
         return
 
     restore_role_id = role_a_restituer.id if role_a_restituer else None
@@ -198,100 +233,144 @@ async def condamne(
     conn.commit()
     conn.close()
 
-    msg = f"✅ Condamnation enregistrée pour **{pseudo}** (le {dt.strftime('%d/%m/%Y')}). Rappel dans 7 jours."
-    if restore_role_id or restore_role_name:
-        display = role_a_restituer.mention if role_a_restituer else restore_role_name
-        msg += f" Rôle à restituer : {display}"
-    await interaction.response.send_message(msg, ephemeral=True)
+    details = f" Rôle à restituer : {role_a_restituer.mention}" if role_a_restituer else (f" Rôle à restituer : {restore_role_name}" if restore_role_name else "")
+    await interaction.response.send_message(
+        f"✅ Condamnation enregistrée pour **{pseudo}** (le {dt.strftime('%d/%m/%Y')}). Rappel dans 7 jours.{details}",
+        ephemeral=True
+    )
 
-# ---------- Diagnostic : /config ----------
-@tree.command(name="config", description="Voir la configuration enregistrée pour ce serveur")
-async def config(interaction: discord.Interaction):
-    s = fetch_settings(interaction.guild_id)
-    if not s:
-        await interaction.response.send_message("Aucune configuration enregistrée pour ce serveur.", ephemeral=True)
-        return
-    arrivants = f"<#{s['arrivants_channel_id']}>" if s['arrivants_channel_id'] else "—"
-    condamnes = f"<#{s['condamnes_channel_id']}>" if s['condamnes_channel_id'] else "—"
-    role = f"<@&{s['gerants_role_id']}>" if s['gerants_role_id'] else "—"
-
-    embed = discord.Embed(title=f"Configuration • {interaction.guild.name}", color=discord.Color.green())
-    embed.add_field(name="Salon arrivants", value=arrivants, inline=False)
-    embed.add_field(name="Salon condamnés", value=condamnes, inline=False)
-    embed.add_field(name="Rôle gérants", value=role, inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ---------- Diagnostic : /due (liste ce qui est dû dans CE serveur) ----------
-@tree.command(name="due", description="Lister ce qui est dû (arrivées/condamnations) pour ce serveur")
-async def due(interaction: discord.Interaction):
-    gid = interaction.guild_id
-    today_iso = datetime.now(TZ).date().isoformat()
-
+@tree.command(name="stats_condamnations", description="Afficher le nombre de condamnations d'un pseudo")
+async def stats_condamnations(interaction: discord.Interaction, pseudo: str):
     conn = get_db_conn()
     cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT a.id, a.pseudo, a.date_iso, a.profile
-        FROM arrivals a
-        JOIN settings s ON s.guild_id = a.guild_id
-        WHERE a.guild_id=?
-          AND a.reminder_sent=0
-          AND s.arrivants_channel_id IS NOT NULL
-          AND date(a.date_iso, '+7 days') <= date(?)
-        """,
-        (gid, today_iso),
-    )
-    arr = cur.fetchall()
-
-    cur.execute(
-        """
-        SELECT c.id, c.pseudo, c.date_iso, c.restore_role_id, c.restore_role_name
-        FROM condemns c
-        JOIN settings s ON s.guild_id = c.guild_id
-        WHERE c.guild_id=?
-          AND c.reminder_sent=0
-          AND s.condamnes_channel_id IS NOT NULL
-          AND date(c.date_iso, '+7 days') <= date(?)
-        """,
-        (gid, today_iso),
-    )
-    con = cur.fetchall()
-
+    cur.execute("SELECT COUNT(*) FROM condemns WHERE guild_id=? AND LOWER(pseudo)=LOWER(?)",
+                (interaction.guild_id, pseudo.strip()))
+    (count,) = cur.fetchone()
     conn.close()
+    await interaction.response.send_message(f"📊 **{pseudo}** a **{count}** condamnation(s).", ephemeral=True)
 
-    if not arr and not con:
-        await interaction.response.send_message("Rien n'est dû pour ce serveur ✅", ephemeral=True)
+# -------- Test immédiat (envoi d'embed) --------
+@tree.command(name="test_ping", description="Envoyer un embed de test immédiatement")
+@app_commands.describe(
+    salon="Salon où envoyer le test",
+    pseudo="Nom/pseudo à afficher",
+    type="Type de message : arrivee ou condamne",
+    profil="(Arrivée) Profil à afficher",
+    role_a_restituer="(Condamné) Rôle à afficher (sélecteur Discord)",
+    role_nom="(Condamné) Nom du rôle en texte si le rôle n'apparaît pas"
+)
+@app_commands.choices(
+    profil=[
+        app_commands.Choice(name="PVM OPTI", value="PVM OPTI"),
+        app_commands.Choice(name="PVM BL", value="PVM BL"),
+        app_commands.Choice(name="PVP OPTI", value="PVP OPTI"),
+        app_commands.Choice(name="PVP PAS OPTI", value="PVP PAS OPTI"),
+    ]
+)
+async def test_ping(
+    interaction: discord.Interaction,
+    salon: discord.TextChannel,
+    pseudo: str,
+    type: Literal["arrivee", "condamne"],
+    profil: Optional[app_commands.Choice[str]] = None,
+    role_a_restituer: Optional[discord.Role] = None,
+    role_nom: Optional[str] = None
+):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌ Permission requise : Gérer le serveur.", ephemeral=True)
         return
 
-    embed = discord.Embed(title="Éléments DÛS", color=discord.Color.orange())
-    if arr:
-        txt = "\n".join([f"• #{r['id']} — {r['pseudo']} (arrivé le {datetime.fromisoformat(r['date_iso']).strftime('%d/%m/%Y')})"
-                         + (f" — profil: {r['profile']}" if r['profile'] else "")
-                         for r in arr])
-        embed.add_field(name=f"Arrivées ({len(arr)})", value=txt[:1024], inline=False)
-    if con:
-        def role_disp(r):
-            if r["restore_role_id"]:
-                return f"<@&{r['restore_role_id']}>"
-            return r["restore_role_name"] or "—"
-        txt = "\n".join([f"• #{r['id']} — {r['pseudo']} (condamné le {datetime.fromisoformat(r['date_iso']).strftime('%d/%m/%Y')}) — rôle: {role_disp(r)}"
-                         for r in con])
-        embed.add_field(name=f"Condamnations ({len(con)})", value=txt[:1024], inline=False)
+    settings = fetch_settings(interaction.guild_id)
+    role_id_gerants = settings["gerants_role_id"] if settings else None
+    ping_gerants = f"<@&{role_id_gerants}>" if role_id_gerants else ""
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if type == "arrivee":
+        ptext = profil.value if profil else "—"
+        embed = discord.Embed(
+            title="🎉 Un nouveau membre a fait son entrée !",
+            description=f"**{pseudo}** a rejoint l’alliance il y a **7 jours** 🎂",
+            color=discord.Color.blurple(),
+            timestamp=now_paris(),
+        )
+        embed.add_field(name="Profil", value=ptext, inline=True)
+        embed.add_field(name="Décision ⚖️", value="On garde ou on kick ?", inline=False)
+        embed.set_footer(text="Rappel arrivants • RevoBot")
+    else:
+        if role_a_restituer:
+            role_display = role_a_restituer.mention
+        elif role_nom and role_nom.strip():
+            role_display = role_nom.strip()
+        else:
+            role_display = "—"
 
-# ---------- Boucle de rappels automatiques (30s pour test) ----------
-@tasks.loop(seconds=30)
+        embed = discord.Embed(
+            title="⚖️ Jugement rendu",
+            description=f"**{pseudo}** a été condamné le **{now_paris().strftime('%d/%m/%Y')}**.\nLa sentence est désormais levée ⛓️",
+            color=discord.Color.dark_red(),
+            timestamp=now_paris(),
+        )
+        embed.add_field(name="Il récupère son rôle de", value=role_display, inline=True)
+        embed.add_field(name="Antécédents 📜", value="**(test)** condamnation(s) au total.", inline=False)
+        embed.set_footer(text="Rappel condamnés • RevoBot")
+
+    await salon.send(
+        content=ping_gerants,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+    )
+    await interaction.response.send_message("✅ Test envoyé.", ephemeral=True)
+
+# -------- Outils admin: due & forcer l’envoi --------
+@tree.command(name="due", description="Voir combien de rappels sont dus aujourd’hui")
+async def due(interaction: discord.Interaction):
+    today_iso = now_paris().date().isoformat()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM arrivals a JOIN settings s ON s.guild_id=a.guild_id "
+        "WHERE a.reminder_sent=0 AND s.arrivants_channel_id IS NOT NULL "
+        "AND date(a.date_iso, '+7 days') <= date(?) AND a.guild_id=?",
+        (today_iso, interaction.guild_id),
+    )
+    (arr_cnt,) = cur.fetchone()
+    cur.execute(
+        "SELECT COUNT(*) FROM condemns c JOIN settings s ON s.guild_id=c.guild_id "
+        "WHERE c.reminder_sent=0 AND s.condamnes_channel_id IS NOT NULL "
+        "AND date(c.date_iso, '+7 days') <= date(?) AND c.guild_id=?",
+        (today_iso, interaction.guild_id),
+    )
+    (con_cnt,) = cur.fetchone()
+    conn.close()
+    if arr_cnt == 0 and con_cnt == 0:
+        await interaction.response.send_message("Rien n'est dû pour ce serveur ✅", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"📌 Dû aujourd'hui : **{arr_cnt}** arrivée(s) • **{con_cnt}** condamnation(s).",
+            ephemeral=True
+        )
+
+@tree.command(name="forcerappel", description="FORCE l'envoi de tous les rappels dus (admins seulement)")
+async def forcerappel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌ Permission requise : Gérer le serveur.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await check_reminders_once()
+    await interaction.followup.send("✅ Rappels forcés envoyés (si dûs).", ephemeral=True)
+
+# ===================== Boucle de rappels ==================
+@tasks.loop(seconds=30)  # 30s pour tester. Mets minutes=5 en prod si tu préfères.
 async def check_reminders():
-    now = datetime.now(TZ)
+    await check_reminders_once()
+
+async def check_reminders_once():
+    now = now_paris()
     today_iso = now.date().isoformat()
-    logger.info(f"[loop] Tick… today={today_iso}")
 
     conn = get_db_conn()
     cur = conn.cursor()
 
-    # Arrivées dues (tous serveurs où config ok)
+    # Arrivées dues
     cur.execute(
         """
         SELECT a.id, a.guild_id, a.pseudo, a.date_iso, a.profile,
@@ -299,8 +378,8 @@ async def check_reminders():
         FROM arrivals a
         JOIN settings s ON s.guild_id = a.guild_id
         WHERE a.reminder_sent=0
-          AND s.arrivants_channel_id IS NOT NULL
           AND date(a.date_iso, '+7 days') <= date(?)
+          AND s.arrivants_channel_id IS NOT NULL
         """,
         (today_iso,),
     )
@@ -314,20 +393,21 @@ async def check_reminders():
         FROM condemns c
         JOIN settings s ON s.guild_id = c.guild_id
         WHERE c.reminder_sent=0
-          AND s.condamnes_channel_id IS NOT NULL
           AND date(c.date_iso, '+7 days') <= date(?)
+          AND s.condamnes_channel_id IS NOT NULL
         """,
         (today_iso,),
     )
     condemns_due = cur.fetchall()
 
+    logger.info(f"[loop] Tick… today={today_iso}")
     logger.info(f"[loop] Arrivées dues={len(arrivals_due)} | Condamnations dues={len(condemns_due)}")
 
     # ----- Envoi Arrivées -----
     for row in arrivals_due:
         try:
             channel = await client.fetch_channel(row["arrivants_channel_id"])
-            ping = f"<@&{row['gerants_role_id']}>" if row["gerants_role_id"] else ""
+            role_tag = f"<@&{row['gerants_role_id']}>" if row["gerants_role_id"] else ""
             pseudo = row["pseudo"]
             profile = row["profile"] or "—"
 
@@ -335,16 +415,19 @@ async def check_reminders():
                 title="🎉 Un nouveau membre a fait son entrée !",
                 description=f"**{pseudo}** a rejoint l’alliance il y a **7 jours** 🎂",
                 color=discord.Color.blurple(),
-                timestamp=datetime.now(TZ),
+                timestamp=now_paris(),
             )
             embed.add_field(name="Profil", value=profile, inline=True)
             embed.add_field(name="Décision ⚖️", value="On garde ou on kick ?", inline=False)
             embed.set_footer(text="Rappel arrivants • RevoBot")
 
-            await channel.send(content=ping, embed=embed, allowed_mentions=ALLOWED_MENTIONS)
+            await channel.send(
+                content=role_tag,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
             cur.execute("UPDATE arrivals SET reminder_sent=1 WHERE id=?", (row["id"],))
             conn.commit()
-            logger.info(f"[loop] Rappel ARRIVEE envoyé • guild={row['guild_id']} pseudo={pseudo}")
         except Exception as e:
             logger.exception(f"Erreur rappel arrivée : {e}")
 
@@ -358,8 +441,9 @@ async def check_reminders():
             )
             (count,) = cur.fetchone()
 
-            fr_date = datetime.fromisoformat(row["date_iso"]).strftime("%d/%m/%Y")
-            ping = f"<@&{row['gerants_role_id']}>" if row["gerants_role_id"] else ""
+            fr_date = iso_to_fr(row["date_iso"])
+            role_tag = f"<@&{row['gerants_role_id']}>" if row["gerants_role_id"] else ""
+            pseudo = row["pseudo"]
 
             if row["restore_role_id"]:
                 role_text = f"<@&{row['restore_role_id']}>"
@@ -370,18 +454,21 @@ async def check_reminders():
 
             embed = discord.Embed(
                 title="⚖️ Jugement rendu",
-                description=f"**{row['pseudo']}** a été condamné le **{fr_date}**.\nLa sentence est désormais levée ⛓️",
+                description=f"**{pseudo}** a été condamné le **{fr_date}**.\nLa sentence est désormais levée ⛓️",
                 color=discord.Color.dark_red(),
-                timestamp=datetime.now(TZ),
+                timestamp=now_paris(),
             )
             embed.add_field(name="Il récupère son rôle de", value=role_text, inline=True)
             embed.add_field(name="Antécédents 📜", value=f"**{count}** condamnation(s) au total.", inline=False)
             embed.set_footer(text="Rappel condamnés • RevoBot")
 
-            await channel.send(content=ping, embed=embed, allowed_mentions=ALLOWED_MENTIONS)
+            await channel.send(
+                content=role_tag,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
             cur.execute("UPDATE condemns SET reminder_sent=1 WHERE id=?", (row["id"],))
             conn.commit()
-            logger.info(f"[loop] Rappel CONDAMNE envoyé • guild={row['guild_id']} pseudo={row['pseudo']}")
         except Exception as e:
             logger.exception(f"Erreur rappel condamnation : {e}")
 
@@ -391,7 +478,7 @@ async def check_reminders():
 async def before_check_reminders():
     await client.wait_until_ready()
 
-# ---------- Lancement ----------
+# ===================== Lancement ==========================
 def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
@@ -401,4 +488,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
